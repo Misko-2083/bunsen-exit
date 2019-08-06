@@ -1,0 +1,9 @@
+@define-color bg_color #838383;
+
+.button:active {
+ background-color: #838383;
+}
+
+.button:hover {
+ background: #838383;
+}
