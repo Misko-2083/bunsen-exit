@@ -45,7 +45,7 @@ onerror = novisual
 
 [style]
 dir = styles
-rcfile = helium.rc
+rcfile = misko.css
 
 ### THEME to be used ###################################################
 # When the [theme] section is not present or commented out
