@@ -1,4 +1,4 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 #    bl-exit: Bunsenlabs exit dialog, offering various exit options
@@ -29,11 +29,27 @@ import sys
 import getpass
 import subprocess
 import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+dbus_loop = DBusGMainLoop()
 import struct
-import ConfigParser
+import configparser
+import fcntl
 
 __me__ = 'bl-exit'
-__version__ = '2.2.1'
+__version__ = '3'
+
+supports_alpha = False
+
+# Allow only one instance of this application
+def run_once():
+	global fh
+	fh = open(os.path.realpath(__file__), 'r')
+	try:
+		fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except:
+		print("There is another instance of " + __me__ +
+			" already running.")
+		sys.exit()
 
 # Translate command-line option to method - command line only
 actionToMethod = dict(
@@ -58,11 +74,10 @@ class BlexitBase(object):
 
 	def setup_dbus_connection(self):
 		try:
-			bus = dbus.SystemBus()
+			bus = dbus.SystemBus(mainloop=dbus_loop)
 			dbus_object = bus.get_object('org.freedesktop.login1',
 										 '/org/freedesktop/login1')
-			self.dbus_iface = dbus.Interface(dbus_object,
-											 'org.freedesktop.login1.Manager')
+			self.dbus_iface = dbus.Interface(dbus_object, 'org.freedesktop.login1.Manager')
 		except bus.DBusException as e:
 			self.on_error(str(e))
 
@@ -90,6 +105,9 @@ class BlexitBase(object):
 			return str(response)
 		except dbus.DBusException as e:
 			self.on_error(str(e))
+			return False
+
+		return True
 
 	def on_error(self, string):
 		print_message("{} {}".format(__me__, string))
@@ -134,22 +152,25 @@ class BlexitBase(object):
 if display:
 	"""Testing for display here because we want to be able to run the script
 	in a non-graphical environment as well. Without the test, importing
-	gtk.Window in a non-graphical environment spits out some errors and crashes
-	the application."""
-	import pygtk
-	pygtk.require('2.0')
-	import gtk
+	Gtk.Window in a non-graphical environment spits out some errors and crashes
+       	the application."""
+	from gi import require_version
+	require_version("Gtk", "3.0")
+	require_version("Gdk", "3.0")
+	from gi.repository import Gtk, Gdk
+	from gi.repository.GdkPixbuf import Pixbuf
 	from time import sleep
-
+	import cairo
 
 	class Blexit(BlexitBase):
 		"""A dialog offering the user to log out, suspend, reboot or shut down.
 		"""
 		def _key_press_event(self, widget, event):
 			keyval = event.keyval
-			keyval_name = gtk.gdk.keyval_name(keyval)
+			keyval_name = Gdk.keyval_name(keyval)
 			state = event.state
-			alt = (state & gtk.gdk.MOD1_MASK)
+
+			alt = (state & Gdk.KEY_Alt_L)
 			# Suspend Shortcut
 			if alt and keyval_name == 's':
 				Blexit.suspend_action(self, widget)
@@ -168,6 +189,8 @@ if display:
 			# Hybrid Sleep Shortcut
 			elif alt and keyval_name == 'y':
 				Blexit.hybridsleep_action(self,  widget)
+			elif alt and keyval_name == 'c':
+				Blexit.cancel_action(self, widget)
 			# Cancel Shortcut
 			elif keyval_name == 'Escape':
 				Blexit.cancel_action(self, widget)
@@ -175,9 +198,12 @@ if display:
 				return False
 			return True
 
+		def _click_outside(self, widget, event):
+			Gtk.main_quit()
+
 		def __init__(self, cp, config_file):
 			BlexitBase.__init__(self)
-			self.window = gtk.Window(gtk.WINDOW_TOPLEVEL)
+			self.window = Gtk.Window(Gtk.WindowType.TOPLEVEL)
 			self.window.set_name('blexit')
 			self.cp = cp
 			self.config_file = config_file
@@ -186,19 +212,47 @@ if display:
 			self.window.set_decorated(True)
 			self.window.connect("delete_event", self.destroy)
 			self.window.connect("destroy_event", self.destroy)
-			self.window.connect("key-press-event", self._key_press_event)
+			self.window.set_skip_taskbar_hint(True)
+			self.window.set_skip_pager_hint(True)
 			self.window.set_resizable(False)
+			self.window.set_border_width(10)
+			self.window.grab_focus()
+			self.window.set_app_paintable(True)
+			self.window.add_events(Gdk.EventMask.KEY_PRESS_MASK)
+			self.window.connect("key-press-event", self._key_press_event)
+			self.window.add_events(Gdk.EventMask.FOCUS_CHANGE_MASK)
+			#self.window.connect("focus-out-event", self._click_outside)
+
+			self.window.set_position(Gtk.WindowPosition.CENTER)
 			self.window.set_keep_above(True)
 			self.window.stick()
-			self.window.set_position(gtk.WIN_POS_CENTER)
-			windowicon = self.window.render_icon(gtk.STOCK_QUIT, gtk.ICON_SIZE_DIALOG)
-			self.window.set_icon(windowicon)
+			self.window.connect('destroy', Gtk.main_quit)
+
+		def set_custom_style(self):
+			try:
+				stylesdir = self.cp.get('style', 'dir')
+				rcfile = self.cp.get('style', 'rcfile')
+				stylerc = os.path.join(os.path.dirname(self.config_file), stylesdir, rcfile)
+				if not os.path.isfile(stylerc):
+					self.on_debug("custom style rc file does not exist")
+					return None
+				print(stylerc)
+				css = """@import url("{}");""".format(stylerc)
+				css_provider = Gtk.CssProvider()
+				css_provider.load_from_data(bytes(css.encode()))
+				Gtk.StyleContext.add_provider_for_screen(
+					Gdk.Screen.get_default(), css_provider,
+					Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+				)
+			except:
+				print("custom style not configured or parse error")
+				pass
 
 		def configure(self):
 			if self.config_file:
 				try:
 					self.cp.read(self.config_file)
-				except ConfigParser.ParsingError as e:
+				except configparser.ParsingError as e:
 					print_message("{}: {}".format(__me__, str(e)))
 					sys.exit(1)
 			else:
@@ -214,39 +268,24 @@ if display:
 					self.cp.add_section(section)
 					self.cp.set(section, "show", "always")
 
-		def set_custom_style(self):
-			try:
-				stylesdir = self.cp.get('style', 'dir')
-				rcfile = self.cp.get('style', 'rcfile')
-				stylerc = os.path.join(os.path.dirname(self.config_file), stylesdir, rcfile)
-				if not os.path.isfile(stylerc):
-					self.on_debug("custom style rc file does not exist")
-					return None
-				gtk.rc_parse(stylerc)
-				settings = gtk.settings_get_for_screen(self.window.get_screen())
-				gtk.rc_reset_styles(settings)
-			except:
-				self.on_debug("custom style not configured or parse error")
-				pass
 
 		def construct_ui(self):
 			self.window.set_title("Log out " + getpass.getuser() + "?")
 			self.window.height = 80
 
 			# Cancel key (Escape)
-			accelgroup = gtk.AccelGroup()
-			key, mod = gtk.accelerator_parse('Escape')
-			accelgroup.connect_group(key, mod, gtk.ACCEL_VISIBLE,
-									 gtk.main_quit)
+			accelgroup = Gtk.AccelGroup()
+			key, mod = Gtk.accelerator_parse('Escape')
+			accelgroup.connect(key, mod, Gtk.AccelFlags.VISIBLE,
+									 Gtk.main_quit)
 			self.window.add_accel_group(accelgroup)
 
 			self.button_width = 100
 			self.button_height = 50
 			self.button_border_width = 4
 			self.window.set_border_width(10)
-			self.button_box = gtk.HButtonBox()
-			self.button_box.set_spacing(0)
-			self.button_box.set_layout(gtk.BUTTONBOX_SPREAD)
+			self.button_box = Gtk.Box(Gtk.Orientation.HORIZONTAL)
+			self.button_box.set_spacing(10)
 			self.build_button_visibility_array()
 			visible_button_count = 0
 			for button in self.bva:
@@ -254,9 +293,9 @@ if display:
 				if not show == 0:
 					visible_button_count += 1
 					self.add_button(show, actionfunc, label=label)
-			self.status = gtk.Label()
-			label_box = gtk.HBox()
-			label_box.pack_start(self.status)
+			self.status = Gtk.Label()
+			label_box = Gtk.Box(Gtk.Orientation.VERTICAL)
+			label_box.pack_start(self.status, True, True, 10)
 
 			# allow for username of about twenty characters: len(title) + 200
 			# approximation: counting characters, not size of rendered string
@@ -269,15 +308,16 @@ if display:
 			else:
 				self.window.width = -1
 			self.window.set_size_request(self.window.width, self.window.height)
-			vbox = gtk.VBox()
-			vbox.pack_start(self.button_box)
-			vbox.pack_start(label_box)
+			vbox = Gtk.Box()
+			vbox.set_orientation(Gtk.Orientation.VERTICAL)
+			vbox.pack_start(self.button_box, False, False, 0)
+			vbox.pack_start(label_box, False, False, 0)
 			self.window.add(vbox)
 			self.window.show_all()
 
 		def destroy(self, widget=None, event=None, data=None):
-			self.window.hide_all()
-			gtk.main_quit()
+			self.window.hide()
+			Gtk.main_quit()
 
 		def build_button_visibility_array(self):
 			"""Determine button visibily using bl-exit configuration file.
@@ -327,7 +367,7 @@ if display:
 									if not candoit == 'yes':
 										show = 3
 							self.on_debug("config section {} show={}".format(section,show))
-						except ConfigParser.NoOptionError as e:
+						except configparser.NoOptionError as e:
 							self.on_debug("config section {}  no option show".format(section))
 							pass
 
@@ -336,10 +376,10 @@ if display:
 							if getonerror in onerror_values:
 								onError = onerror_values[getonerror]
 							self.on_debug("config section {} onerror={}".format(section,onError))
-						except ConfigParser.NoOptionError as e:
+						except configparser.NoOptionError as e:
 							self.on_debug("config section {} no option onerror".format(section))
 							pass
-					except ConfigParser.NoSectionError as e:
+					except configparser.NoSectionError as e:
 						self.on_debug("config section {} not present".format(section))
 						pass
 
@@ -351,19 +391,19 @@ if display:
 			self.configure()
 			self.set_custom_style()
 			self.construct_ui()
-			gtk.main()
+			Gtk.main()
 
 		def add_button(self, show, action, label=None, stock=None):
 			if stock is not None:
-				button = gtk.Button(stock=stock)
+				button = Gtk.Button(stock)
 			else:
-				button = gtk.Button(label=label)
+				button = Gtk.Button.new_with_mnemonic(label)
 			button.set_size_request(self.button_width, self.button_height)
 			if show == 3:
 				button.set_sensitive(False)
 			button.set_border_width(self.button_border_width)
 			button.connect("clicked", action)
-			self.button_box.pack_start(button)
+			self.button_box.pack_start(button, True, True, 0)
 
 		def disable_buttons(self):
 			self.button_box.foreach(lambda button:
@@ -371,7 +411,7 @@ if display:
 
 		def cancel_action(self, button):
 			self.disable_buttons()
-			gtk.main_quit()
+			Gtk.main_quit()
 
 		def get_onerror(self):
 			onerror = 0
@@ -389,10 +429,8 @@ if display:
 				print_message("{}: {}".format(__me__, str(e)))
 				sys.exit(1)
 			else:
-				emDialog = gtk.MessageDialog(parent=None, flags=0,
-											 type=gtk.MESSAGE_INFO,
-											 buttons=gtk.BUTTONS_OK,
-											 message_format=None)
+				emDialog = Gtk.MessageDialog(None, 0, Gtk.MessageType.INFO,
+											 Gtk.ButtonsType.OK, None)
 				if emDialog:
 					emDialog.set_markup("{}".format(e))
 					emDialog.run()
@@ -500,11 +538,11 @@ if display:
 			self.settings[key] = value
 
 		def set_details_from_config(self, cp, default_theme):
-			for key in default_theme_settings.iterkeys():
+			for key in default_theme_settings.keys():
 				default_theme_detail = default_theme_settings[key]
 				try:
 					config_value = cp.get(self.theme, key)
-				except ConfigParser.NoOptionError as e:
+				except configparser.NoOptionError as e:
 					self.blexit.on_debug("theme config option {} is not set for theme {}".format(key, self.theme))
 					config_value = None
 					pass
@@ -531,13 +569,12 @@ if display:
 	class BlexitMerlin(Blexit):
 		"""A dialog offering the user to log out, suspend, reboot or shut down.
 		With a graphical UI initially developed by MerlinElMago.
-		:param cp: ConfigParser instance
+		:param cp: configparser instance
 		:param config_file: path to blexit config file
 		"""
 		def __init__(self, cp, config_file):
 			Blexit.__init__(self, cp, config_file)
 			self.window.set_decorated(False)
-			self.tooltips = gtk.Tooltips()
 
 		def configure(self):
 			Blexit.configure(self)
@@ -551,14 +588,9 @@ if display:
 			# get width of the monitor where the cursor is
 			width = 800 # fallback width
 			try:
-				display=gtk.gdk.Display(gtk.gdk.get_display())
-				screen, x, y, flags=display.get_pointer()
-				curmon = screen.get_monitor_at_point(x, y)
-				_, _, screenwidth, _ = screen.get_monitor_geometry(curmon)
+				screenwidth = Gdk.Screen.width()
 			except:
 				self.bl_exit.on_error('Error in construct_ui: Not running under X')
-			finally:
-				del x, y, display, screen, curmon
 
 			try:
 				_width_adjustment = float(self.configured_theme.settings.get('windowWidthAdjustment', 0))
@@ -579,12 +611,12 @@ if display:
 				pass
 			self.icon_widths = []
 			# Cancel key (Escape)
-			accelgroup = gtk.AccelGroup()
-			key, mod = gtk.accelerator_parse('Escape')
-			accelgroup.connect_group(key, mod, gtk.ACCEL_VISIBLE, gtk.main_quit)
+			accelgroup = Gtk.AccelGroup()
+			key, mod = Gtk.accelerator_parse('Escape')
+			accelgroup.connect(key, mod, Gtk.AccelFlags.VISIBLE, Gtk.main_quit)
 			self.window.add_accel_group(accelgroup)
 
-			self.button_box = gtk.HBox()
+			self.button_box = Gtk.Box(Gtk.Orientation.HORIZONTAL)
 			self.button_box.set_spacing(0)
 
 			try:
@@ -606,7 +638,7 @@ if display:
 					icon_width = self.add_button(show, actionfunc, label=label, btype=actionToMethod[action])
 					#get list of returned icon widths
 					self.icon_widths.append(icon_width)
-			self.status = gtk.Label()
+			self.status = Gtk.Label()
 
 			if len(self.icon_heights) > 0:
 				self.dialogHeight = max(self.icon_heights)
@@ -623,27 +655,38 @@ if display:
 			
 			self.window.set_size_request(width, self.dialogHeight)
 
-			vbox = gtk.VBox()
-			vbox.pack_start(self.button_box)
+			vbox = Gtk.Box(Gtk.Orientation.VERTICAL)
+			vbox.pack_start(self.button_box, True, True, 0)
 			self.window.add(vbox)
-			self.window.set_opacity(0)
-			self.window.show_all()
 			try:
 				for o in range(1, int(self.configured_theme.settings.get('overallOpacity'))):
 					sleep(float(self.configured_theme.settings.get('sleepDelay')))
-					while gtk.events_pending():
-						gtk.main_iteration(False)
-						self.window.set_opacity(float(o)/100.0)
+					self.opacity = float(float(o)/100.0)
 			except:
-				self.on_debug("Opacity is not fully configured")
+				print("Opacity is not fully configured")
 				pass
+			self.window.connect('draw', self.draw)
+
+			screen = self.window.get_screen()
+			visual = screen.get_rgba_visual()
+			if visual and screen.is_composited():
+				self.window.set_visual(visual)
+
+			self.window.set_app_paintable(True)
 			self.window.set_keep_above(True)
+			self.window.show_all()
+
+		def draw(self, widget, context):
+			context.set_source_rgba(0, 0, 0, self.opacity)
+			context.set_operator(cairo.OPERATOR_SOURCE)
+			context.paint()
+			context.set_operator(cairo.OPERATOR_OVER)
 
 		def main(self):
 			self.configure()
 			self.set_custom_style()
 			self.construct_ui()
-			gtk.main()
+			Gtk.main()
 
 		def add_button(self, show, action, label=None, btype=None):
 
@@ -659,16 +702,21 @@ if display:
 					if os.path.exists(os.path.join(_dir, _filename)):
 						return os.path.join(_dir, _filename)
 
-			button = gtk.Button()
-			button.set_relief(gtk.RELIEF_NONE)
-			image = gtk.Image()
+			button = Gtk.Button()
+			button.set_relief(Gtk.ReliefStyle.NONE)
+
 			_filename = find_image_file_for_button()
 			if _filename is not None:
-				image.set_from_file(_filename)
-				icon_w,icon_h = self.get_image_info(_filename)
-				self.icon_heights.append(icon_h)
+				pixbuf = Pixbuf.new_from_file_at_scale(
+					filename=_filename, 
+					width=48, 
+					height=48, 
+					preserve_aspect_ratio=True)
+
+				image = Gtk.Image.new_from_pixbuf(pixbuf)
+				icon_w = icon_h = 24
 			else:
-				image.set_from_file('/usr/share/gtk-doc/html/pygtk/icons/stock_broken_image_24.png')
+				#image.set_from_file('/usr/share/gtk-doc/html/pygtk/icons/stock_broken_image_24.png')
 				self.on_warning("image file for '{}' not found.".format(str(btype)))
 			button.set_image(image)
 
@@ -676,9 +724,9 @@ if display:
 				button.set_sensitive(False)
 			button.set_border_width(0)
 			button.connect("clicked", action)
-			self.button_box.pack_start(button, expand=True, fill=True, padding=0)
+			self.button_box.pack_start(button, True, True, 0)
 
-			self.tooltips.set_tip(button, str(btype))
+			button.set_tooltip_text(str(btype))
 			return icon_w
 
 		def get_image_info(self, img_path):
@@ -755,13 +803,13 @@ def get_config_theme_entry(section, item, cp):
 	:param
 	  section: String, config section
 	  item:    String, config item
-	  cp:      ConfigParser, instance
+	  cp:      configparser, instance
 	:out
 	  string or None"""
 	if (cp.has_section(section)):
 		try:
 			_item = cp.get(section, item)
-		except ConfigParser.NoOptionError:
+		except configparser.NoOptionError:
 			_item = None
 		return _item
 	else:
@@ -770,23 +818,20 @@ def get_config_theme_entry(section, item, cp):
 def main():
 	'''
 	The script works both in a graphical and a non-graphical environment.
-
 	In a graphical environment, the BlExitWindow instance is only shown when
 	the script is launched without arguments. The user selects the action she
 	wants by clicking the right button.
-
 	WHen  the script is launched In a non-graphical environment the requested
 	action should be one of the accepted arguments and the action is executed
 	without asking for confirmation - as if the script was launched from the
 	command line.
-
 	In a non-graphical environment, one of the accepted actions must be
 	specified as an argument.
 	'''
 	if display and len(sys.argv[1:]) == 0:
 		try:
-			# import ConfigParser
-			cp = ConfigParser.RawConfigParser()
+			# import configparser
+			cp = configparser.RawConfigParser()
 			config_file = get_config_file()
 			if config_file:
 				cp.read(config_file)
@@ -798,10 +843,10 @@ def main():
 					blexit = Blexit(cp, config_file)
 			else:
 				blexit = Blexit(cp, config_file)
-		except ConfigParser.ParsingError as e:
+		except configparser.ParsingError as e:
 			print_message(str(e))
 			return 1
-		except ConfigParser.NoOptionError as e:
+		except configparser.NoOptionError as e:
 			print_message(str(e))
 			blexit = Blexit(cp, config_file)
 	else:
@@ -809,5 +854,11 @@ def main():
 
 	return blexit.main()
 
-if __name__ == "__main__":
-	sys.exit(main())
+if __name__ == '__main__':
+	fh = 0
+	try:
+		run_once()
+		main()
+	except (Exception, AttributeError) as e:
+		print("Exiting due to error: {0}".format(e))
+		sys.exit(1)
